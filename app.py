@@ -1,116 +1,61 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-import requests
 import json
 from typing import List, Dict, Any, Mapping, Optional
 import os
 from dotenv import load_dotenv
 import re
+import google.generativeai as genai # Added for Gemini
 
 # Langchain imports
 from langchain.chains.summarize import load_summarize_chain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.prompts import PromptTemplate
 from langchain.docstore.document import Document
-from langchain.llms.base import LLM
-from langchain.callbacks.manager import CallbackManagerForLLMRun
+# from langchain.llms.base import LLM # No longer needed for direct LLM wrapper
+# from langchain.callbacks.manager import CallbackManagerForLLMRun # No longer needed
+from langchain_google_genai import ChatGoogleGenerativeAI # Added for Gemini LLM
+from langchain_google_genai.chat_models import ChatGoogleGenerativeAIError # Added for specific error handling
 
 # Load environment variables
 load_dotenv()
 
 # FastAPI 애플리케이션 설정
 app = FastAPI(
-    title='회의 인사이트 추출 API (Langchain)',
-    description='Langchain Map-Reduce를 사용하여 회의록을 분석하고 핵심 인사이트를 JSON 형식으로 반환하는 API',
-    version='1.1'
+    title='회의 인사이트 추출 API (Gemini & Langchain)',
+    description='Langchain Map-Reduce와 Google Gemini를 사용하여 회의록을 분석하고 핵심 인사이트를 JSON 형식으로 반환하는 API',
+    version='1.2' # Version updated
 )
 
-LLAMA_API_URL = os.getenv("LLAMA_API_URL")
+# Load Google API Key
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY 환경 변수가 설정되지 않았습니다.")
 
-if not LLAMA_API_URL:
-    raise ValueError("LLAMA_API_URL 환경 변수가 설정되지 않았습니다.")
+# Configure Google Generative AI
+genai.configure(api_key=GOOGLE_API_KEY)
 
-# Llama API 호출 래퍼 (기존 코드 유지)
-class LlamaAPI:
-    def __init__(self, api_url: str):
-        self.api_url = api_url
-
-    def __call__(self, prompt: str) -> str:
-        payload = {
-            "messages": [
-                {
-                "user": prompt
-                }
-            ],
-            "max_tokens": 32768,
-            "temperature": 0.7,
-            "top_p": 0.9
-        }
-        try:
-            response = requests.post(self.api_url, json=payload, timeout=120) # Increased timeout
-            response.raise_for_status()
-            result = response.json()
-            # Assuming the response structure is like {'response': '...'}
-            if "text" not in result:
-                 raise ValueError("LLM 응답에 'text' 키가 없습니다.")
-            # Clean the response string
-            cleaned_result = result["text"]
-            cleaned_result = re.sub(r'<think>.*?</think>\s*\n*', '', cleaned_result, flags=re.DOTALL)
-            cleaned_result = cleaned_result.replace('```json\n', "").replace('```', "").strip()
-            print(f"LLM API 응답: {result}")  # Debugging line to check the response
-            return cleaned_result
-        except requests.exceptions.Timeout:
-             raise HTTPException(status_code=504, detail="LLM API 요청 시간 초과")
-        except requests.exceptions.RequestException as e:
-            raise HTTPException(status_code=503, detail=f"LLM API 요청 실패: {e}")
-        except (ValueError, KeyError) as e:
-            # Catch potential issues with response structure or cleaning
-            raise HTTPException(status_code=500, detail=f"LLM 응답 처리 오류: {e}")
-        except Exception as e:
-            # Catch any other unexpected errors during the API call
-             raise HTTPException(status_code=500, detail=f"LLM API 호출 중 예기치 않은 오류: {e}")
-
-# Custom Langchain LLM Wrapper
-class CustomLlamaLangchain(LLM):
-    llama_api: LlamaAPI
-
-    @property
-    def _llm_type(self) -> str:
-        return "custom_llama"
-
-    def _call(
-        self,
-        prompt: str,
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
-        **kwargs: Any,
-    ) -> str:
-        # Note: The 'stop' parameter is not explicitly handled by LlamaAPI but is part of the LLM interface.
-        # LlamaAPI handles exceptions internally and raises HTTPException if needed.
-        try:
-            return self.llama_api(prompt)
-        except HTTPException as http_exc:
-            # Re-raise HTTPException to be caught by FastAPI error handling
-            raise http_exc
-        except Exception as e:
-            # Wrap other exceptions potentially missed by LlamaAPI's handler
-            raise RuntimeError(f"CustomLlamaLangchain 내부 오류: {e}") from e
-
-
-    @property
-    def _identifying_params(self) -> Mapping[str, Any]:
-        """Get the identifying parameters."""
-        return {"api_url": self.llama_api.api_url}
-
-# 전역 LLM 인스턴스 (Langchain Wrapper 사용)
+# 전역 LLM 인스턴스 (Gemini 사용)
 try:
-    llama_api_instance = LlamaAPI(LLAMA_API_URL)
-    langchain_llm = CustomLlamaLangchain(llama_api=llama_api_instance)
+    # Initialize the Gemini LLM using the Langchain wrapper
+    # Using "gemini-1.5-flash" as it's generally available and efficient
+    langchain_llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash-preview-04-17",
+        temperature=0.3,
+        # convert_system_message_to_human=True # May be needed depending on prompt structure
+        # Add safety settings if needed, e.g.,
+        # safety_settings={
+        #     genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT: genai.types.HarmBlockThreshold.BLOCK_NONE,
+        #     # Add other categories as needed
+        # }
+    )
+    # Perform a simple test call to ensure the API key is valid and the model is accessible
+    langchain_llm.invoke("Test prompt")
+    print("Gemini LLM 초기화 성공.")
 except Exception as e:
-    # Handle potential errors during LLM initialization (e.g., invalid URL)
-    print(f"LLM 초기화 실패: {e}")
-    # Depending on the desired behavior, you might exit or disable the endpoint
-    langchain_llm = None # Or raise an error to prevent app startup
+    # Handle potential errors during LLM initialization (e.g., invalid API key, network issues)
+    print(f"Gemini LLM 초기화 실패: {e}")
+    langchain_llm = None # Set to None to prevent app from running with a broken LLM
 
 # Prompt 템플릿 (Langchain 형식)
 # Note: Ensure the variable name in the template matches the input variable for the chain ('text' or 'input_documents')
@@ -136,12 +81,13 @@ REDUCE_PROMPT_TEMPLATE = """
 당신은 ‘최종 인사이트 필터링 전문가’입니다.
 Map 단계에서 추출된 여러 후보 인사이트 목록을 검토하고, 중복되는 내용을 합치고, 이를 정리하여 최종 3개의 핵심 인사이트로 요약하세요.
 각 인사이트는 상세한 인사이트를 담은 문장이어야 하며, 반드시 JSON 객체 형태로만 출력하세요.
+score 정확도 점수는 0.0에서 1.0 사이의 값으로, 인사이트의 신뢰도를 나타냅니다. 유사도를 평가하세요.
 
 반드시 다음 형식으로만 응답하세요:
 {{
-  "1": "첫 번째 핵심 인사이트",
-  "2": "두 번째 핵심 인사이트",
-  "3": "세 번째 핵심 인사이트"
+  "1": {{"insight": "첫 번째 핵심 인사이트", "score": 정확도 점수}},
+  "2": {{"insight": "두 번째 핵심 인사이트", "score": 정확도 점수}},
+  "3": {{"insight": "세 번째 핵심 인사이트", "score": 정확도 점수}}
 }}
 
 후보 인사이트 목록 (입력):
@@ -160,27 +106,31 @@ reduce_prompt = PromptTemplate(template=REDUCE_PROMPT_TEMPLATE, input_variables=
 class AnalyzeRequest(BaseModel):
     text: str = Field(..., description='회의 내용')
 
+class InsightItem(BaseModel):
+    insight: str
+    score: float
+
 class AnalyzeResponse(BaseModel):
-    insight_1: str = Field(..., alias='1', description='첫 번째 인사이트')
-    insight_2: str = Field(..., alias='2', description='두 번째 인사이트')
-    insight_3: str = Field(..., alias='3', description='세 번째 인사이트')
+    insight_1: InsightItem = Field(..., alias='1', description='첫 번째 인사이트')
+    insight_2: InsightItem = Field(..., alias='2', description='두 번째 인사이트')
+    insight_3: InsightItem = Field(..., alias='3', description='세 번째 인사이트')
 
     class Config:
-        allow_population_by_field_name = True
+        validate_by_name = True # Updated from allow_population_by_field_name
         # Example added for clarity in OpenAPI docs
-        schema_extra = {
+        json_schema_extra = { # Updated from schema_extra
             "example": {
-                "1": "프로젝트 A의 주요 위험 요소는 예산 초과 가능성입니다.",
-                "2": "마케팅 팀은 다음 분기 캠페인 전략을 재검토해야 합니다.",
-                "3": "신규 기능 X에 대한 사용자 피드백은 긍정적이지만, 성능 개선이 필요합니다."
+                "1": {"insight": "The main risk for Project A is the possibility of budget overrun.", "score": 0.9}, # Example updated
+                "2": {"insight": "마케팅 팀은 다음 분기 캠페인 전략을 재검토해야 합니다.", "score": 0.85},
+                "3": {"insight": "신규 기능 X에 대한 사용자 피드백은 긍정적이지만, 성능 개선이 필요합니다.", "score": 0.8}
             }
         }
 
 
-@app.post("/analyze", response_model=AnalyzeResponse, summary="회의록 분석 및 인사이트 추출 (Langchain)")
-async def analyze_meeting_langchain(request: AnalyzeRequest):
+@app.post("/analyze", response_model=AnalyzeResponse, summary="회의록 분석 및 인사이트 추출 (Gemini & Langchain)")
+async def analyze_meeting_gemini(request: AnalyzeRequest): # Renamed function
     if not langchain_llm:
-         raise HTTPException(status_code=503, detail="LLM 서비스가 초기화되지 않았습니다.")
+         raise HTTPException(status_code=503, detail="Gemini LLM 서비스가 초기화되지 않았습니다.")
 
     try:
         # 1) Text Splitting
@@ -215,13 +165,15 @@ async def analyze_meeting_langchain(request: AnalyzeRequest):
 
         # 4) Parse Final JSON Output
         try:
+            summary_json_str=re.sub(r"^```json\n|\n```$", "", summary_json_str.strip())
+            print(f"Reduce 단계 최종 출력: {summary_json_str}") # Debugging output
             final_insights = json.loads(summary_json_str)
             # Validate the structure
             if not isinstance(final_insights, dict) or not all(k in final_insights for k in ["1", "2", "3"]):
                  raise ValueError("Reduce 단계에서 예상된 JSON 객체 형식(키 '1', '2', '3')을 반환하지 않았습니다.")
             # Validate value types (should be strings)
-            if not all(isinstance(v, str) for v in final_insights.values()):
-                 raise ValueError("Reduce 단계 JSON 객체의 값이 문자열이 아닙니다.")
+            if not all(isinstance(v, dict) and isinstance(v.get("insight"), str) for v in final_insights.values()):
+                raise ValueError("Reduce 단계 JSON 객체의 'insight' 값이 문자열이 아닙니다.")
 
         except json.JSONDecodeError:
             raise HTTPException(status_code=500, detail=f"Reduce 단계의 최종 출력을 JSON으로 파싱하는 데 실패했습니다. 출력: {summary_json_str}")
@@ -233,29 +185,41 @@ async def analyze_meeting_langchain(request: AnalyzeRequest):
         # Pydantic will automatically handle the alias mapping for the response
         return final_insights
 
-    # Catch specific HTTPExceptions raised by LlamaAPI or validation
+    # Catch specific HTTPExceptions raised during validation or processing
     except HTTPException as he:
         raise he
-    # Catch potential runtime errors from the Langchain LLM wrapper
-    except RuntimeError as rte:
-         raise HTTPException(status_code=500, detail=f"Langchain LLM 실행 중 오류: {rte}")
-    # Catch any other unexpected errors during the process
+    # Catch specific errors from the Google Generative AI API
+    except ChatGoogleGenerativeAIError as ge:
+        print(f"Gemini API 오류 발생: {ge}")
+        raise HTTPException(status_code=503, detail=f"Gemini API 통신 오류: {ge}")
+    # Catch other potential errors from the Langchain wrapper or general execution
     except Exception as e:
-        # Log the error for debugging purposes if possible
-        print(f"예기치 않은 분석 오류: {e}")
+        # Log the error for debugging purposes
+        print(f"Gemini 분석 중 예기치 않은 오류: {e}")
         raise HTTPException(status_code=500, detail=f"분석 중 예기치 않은 오류 발생: {e}")
 
 # Add a root endpoint for basic check
 @app.get("/")
 async def root():
-    return {"message": "회의 인사이트 추출 API (Langchain) 실행 중"}
+    return {"message": "회의 인사이트 추출 API (Gemini & Langchain) 실행 중"}
 
 # If running directly (for testing)
 if __name__ == "__main__":
     import uvicorn
     # Ensure .env is loaded if running directly
     load_dotenv()
-    API_URL = os.getenv("LLAMA_API_URL")
-    if not API_URL:
-        print("경고: LLAMA_API_URL 환경 변수가 설정되지 않았습니다. API가 제대로 작동하지 않을 수 있습니다.")
+    API_KEY = os.getenv("GOOGLE_API_KEY")
+    if not API_KEY:
+        print("경고: GOOGLE_API_KEY 환경 변수가 설정되지 않았습니다. API가 제대로 작동하지 않을 수 있습니다.")
+    # Initialize LLM here as well for standalone testing if needed, or rely on global init
+    if langchain_llm is None and API_KEY: # Attempt re-init if global failed but key exists
+        try:
+            genai.configure(api_key=API_KEY)
+            langchain_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.7)
+            langchain_llm.invoke("Test prompt") # Test again
+            print("Gemini LLM 초기화 성공 (standalone).")
+        except Exception as e:
+            print(f"Gemini LLM 초기화 실패 (standalone): {e}")
+            langchain_llm = None # Ensure it remains None if init fails
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
